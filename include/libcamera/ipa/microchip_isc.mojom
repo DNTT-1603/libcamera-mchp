@@ -73,7 +73,7 @@ struct AWBStatus {
 /* Main IPA interface */
 interface IPAMicrochipISCInterface {
 	init(libcamera.IPASettings settings) => (int32 ret, bool metadataSupport);
-	start() => (int32 ret);
+	start() => (int32 ret, uint32 dropFrameCount);
 	stop();
 
 	configure(

@@ -137,19 +137,19 @@ void AGC::process(const ImageStats &stats, ControlList &results)
 
 void AGC::initializeSensorCurves()
 {
-	/* IMX219 NoIR - brightness to max exposure mapping */
+	/* IMX219 - brightness to max exposure mapping based on RPi tunings */
 	sensorExposureCurves_["imx219"] = {
 		.points = {
-			{200.0f, 100},   /* Very bright sunlight */
-			{170.0f, 120},   /* Bright outdoor */
-			{150.0f, 160},   /* Slightly less bright */
-			{130.0f, 200},   /* Moderate bright */
-			{110.0f, 250},   /* Mild outdoor */
-			{90.0f, 320},    /* Cloudy */
-			{70.0f, 400},    /* Overcast */
-			{50.0f, 550},    /* Heavy overcast */
-			{35.0f, 700},    /* Dusk/dawn */
-			{0.0f, 1000}     /* Very dim */
+			{200.0f, 200},    /* Very bright sunlight */
+			{170.0f, 400},    /* Bright outdoor */
+			{150.0f, 800},    /* Slightly less bright */
+			{130.0f, 1500},   /* Moderate bright */
+			{110.0f, 3000},   /* Mild outdoor */
+			{90.0f, 5000},    /* Cloudy */
+			{70.0f, 8000},    /* Overcast */
+			{50.0f, 12000},   /* Heavy overcast */
+			{35.0f, 20000},   /* Dusk/dawn */
+			{0.0f, 33000}     /* Very dim */
 		}
 	};
 
@@ -243,6 +243,43 @@ uint32_t AGC::interpolateExposure(float brightness) const
 	LOG(ISC_AGC, Warning) << "Interpolation failed for brightness " << brightness
 		<< " on sensor " << sensorModel_;
 	return calculateAdaptiveExposure(brightness);
+}
+
+uint32_t AGC::calculateAdaptiveExposure(float brightness) const
+{
+	/* Fallback mathematical model when sensor curve is missing or interpolation fails */
+	const std::pair<float, uint32_t> genericPoints[] = {
+		{200.0f, 200},
+		{150.0f, 800},
+		{100.0f, 3000},
+		{50.0f, 12000},
+		{25.0f, 20000},
+		{0.0f, 33000}
+	};
+	
+	if (brightness >= genericPoints[0].first) {
+		return std::max(config_.minExposureTime, genericPoints[0].second);
+	}
+	if (brightness <= genericPoints[5].first) {
+		return std::min(config_.maxExposureTime, genericPoints[5].second);
+	}
+	
+	for (size_t i = 0; i < 5; i++) {
+		if (brightness >= genericPoints[i + 1].first && brightness <= genericPoints[i].first) {
+			float b1 = genericPoints[i + 1].first;
+			float b2 = genericPoints[i].first;
+			float e1 = static_cast<float>(genericPoints[i + 1].second);
+			float e2 = static_cast<float>(genericPoints[i].second);
+			
+			float ratio = (brightness - b1) / (b2 - b1);
+			float interpolatedFloat = e1 + ratio * (e2 - e1);
+			
+			uint32_t interpolated = static_cast<uint32_t>(std::max(0.0f, interpolatedFloat));
+			return std::clamp(interpolated, config_.minExposureTime, config_.maxExposureTime);
+		}
+	}
+	
+	return config_.maxExposureTime / 2; /* Safe default if everything fails */
 }
 
 AGC::BaselineConfig AGC::selectBaseline(const UnifiedSceneAnalysis &scene) const

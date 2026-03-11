@@ -85,6 +85,7 @@ private:
 
 	/* Core methods */
 	void initializeProfessionalProfiles();
+	void initializeIMX219Profiles();
 	CCMProfile calculateOptimalCCM(const UnifiedSceneAnalysis &scene);
 	CCMProfile temporalSmoothing(const CCMProfile &new_profile);
 

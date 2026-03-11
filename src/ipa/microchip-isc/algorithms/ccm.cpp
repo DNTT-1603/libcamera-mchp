@@ -44,7 +44,11 @@ void CCM::configure(const MicrochipISCSensorInfo &sensorInfo)
 		<< sensorInfo.model << " resolution: " << sensorInfo.width << "x" << sensorInfo.height;
 
 	sensorInfo_ = sensorInfo;
-	initializeProfessionalProfiles();
+	if (sensorInfo_.model == "imx219") {
+		initializeIMX219Profiles();
+	} else {
+		initializeProfessionalProfiles();
+	}
 	temporal_history_.clear();
 	convergence_history_.clear();
 	is_converged_ = false;
@@ -186,6 +190,78 @@ void CCM::initializeProfessionalProfiles()
 
 	LOG(ISC_CCM, Debug) << "Initialized " << ccm_profiles_.size()
 		<< " CCM profiles including LED_Neutral";
+}
+
+void CCM::initializeIMX219Profiles()
+{
+	ccm_profiles_.clear();
+
+	/* IMX219 Tungsten (approx 2860K) */
+	ccm_profiles_.push_back({
+			.name = "IMX219_Tungsten",
+			.cct_min = 2000, .cct_max = 3300,
+			.matrix = {
+			2.12089f, -0.52461f, -0.59629f,
+			-0.85342f, 2.80445f, -0.95103f,
+			-0.26897f, -1.14788f, 2.41685f
+			},
+			.offset = {0.0f, 0.0f, 0.0f},
+			.saturation_boost = 1.0f,
+			.accuracy_weight = 0.95f,
+			.fluorescent_bias = 0.0f,
+			.tungsten_bias = 1.0f
+			});
+
+	/* IMX219 Fluorescent/Warm White (approx 3600K) */
+	ccm_profiles_.push_back({
+			.name = "IMX219_Fluorescent",
+			.cct_min = 3300, .cct_max = 4200,
+			.matrix = {
+			2.18644f, -0.66148f, -0.52496f,
+			-0.77828f, 2.69474f, -0.91645f,
+			-0.25239f, -0.83059f, 2.08298f
+			},
+			.offset = {0.0f, 0.0f, 0.0f},
+			.saturation_boost = 1.0f,
+			.accuracy_weight = 0.95f,
+			.fluorescent_bias = 1.0f,
+			.tungsten_bias = 0.0f
+			});
+
+	/* IMX219 Daylight (approx 4650K to 5858K) */
+	ccm_profiles_.push_back({
+			.name = "IMX219_Daylight",
+			.cct_min = 4200, .cct_max = 6000,
+			.matrix = {
+			2.32392f, -0.88421f, -0.43971f,
+			-0.63821f, 2.58348f, -0.94527f,
+			-0.28541f, -0.54112f, 1.82653f
+			},
+			.offset = {0.0f, 0.0f, 0.0f},
+			.saturation_boost = 1.0f,
+			.accuracy_weight = 0.95f,
+			.fluorescent_bias = 0.0f,
+			.tungsten_bias = 0.0f
+			});
+
+	/* IMX219 Cloudy / Shade (approx 7580K) */
+	ccm_profiles_.push_back({
+			.name = "IMX219_Cloudy",
+			.cct_min = 6000, .cct_max = 12000,
+			.matrix = {
+			2.21175f, -0.53242f, -0.67933f,
+			-0.57875f, 3.07922f, -1.50047f,
+			-0.27709f, -0.73338f, 2.01048f
+			},
+			.offset = {0.0f, 0.0f, 0.0f},
+			.saturation_boost = 1.0f,
+			.accuracy_weight = 0.95f,
+			.fluorescent_bias = 0.0f,
+			.tungsten_bias = 0.0f
+			});
+
+	LOG(ISC_CCM, Debug) << "Initialized " << ccm_profiles_.size()
+		<< " IMX219 specific CCM profiles based on RPi golden tuning";
 }
 
 void CCM::process(const ImageStats &stats, ControlList &results)

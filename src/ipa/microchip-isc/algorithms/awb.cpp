@@ -84,6 +84,16 @@ void AWB::process(const ImageStats &stats, ControlList &results)
 	/* Process with selected algorithm */
 	WhiteBalanceResult result = selectedAlgorithm->process(stats, lastSceneAnalysis_);
 
+	/* Apply sensor-specific baseline multipliers for hardcoded algorithms */
+	if (sensorInfo_.model == "imx219" && result.algorithmName != "UnifiedGreyWorld") {
+		/* IMX219 has low red/blue sensitivity compared to green.
+		   RPi tuning shows Daylight needs approx R=1.75, B=1.42.
+		   Since hardcoded algorithms are centered around 1.0, we scale them. */
+		result.redGain *= 1.75f;
+		result.blueGain *= 1.42f;
+		LOG(ISC_AWB, Debug) << "Applied IMX219 baseline AWB correction";
+	}
+
 	LOG(ISC_AWB, Info) << "Selected algorithm: " << selectedAlgorithm->getName()
 		<< " CCT: " << result.colorTemperatureEstimate << "K"
 		<< " Confidence: " << result.algorithmConfidence;

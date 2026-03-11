@@ -51,10 +51,12 @@ public:
 		return 0;
 	}
 
-	int32_t start() override
+	int32_t start(uint32_t *dropFrameCount) override
 	{
 		LOG(ISC_IPA, Debug) << "Starting unified scene classification processing";
 		frameCount_ = 0;
+		if (dropFrameCount)
+			*dropFrameCount = 8; /* Request 8 frames for AGC/AWB convergence */
 		return 0;
 	}
 

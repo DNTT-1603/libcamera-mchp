@@ -83,8 +83,8 @@ public:
 		: Camera::Private(pipe), media_(media), bufferCount(0),
 		statsEnabled_(false), statsStreaming_(false),
 		lastHistogramTimestamp_(0), histogramDataReady_(false),
-		currentFrameCount_(0), pendingRequest_(nullptr),
-		isShuttingDown_(false), stopStatsProcessing_(false)
+		currentFrameCount_(0), dropFrameCount_(0), pendingRequest_(nullptr),
+		isShuttingDown_(false)
 
 	{
 		streams_.resize(2);
@@ -139,12 +139,12 @@ public:
 	static constexpr uint64_t HISTOGRAM_FRESHNESS_NS = 500000000;
 
 	int currentFrameCount_;
+	uint32_t dropFrameCount_;
 	Request *pendingRequest_;
 	std::array<bool, 4> channelsSeen_;
 	uint32_t algorithmEnableFlags_ = ipa::microchip_isc::IPA_ALGORITHM_ALL;
 	int32_t sceneAnalysisMode_ = 0;  /* 0 = VIDEO_MODE, 1 = STILL_MODE */
 	std::atomic<bool> isShuttingDown_;
-	std::atomic<bool> stopStatsProcessing_;
 
 	void resetFrameCycling() {
 		currentFrameCount_ = 0;
@@ -350,12 +350,6 @@ void MicrochipISCCameraData::statsBufferReady(FrameBuffer *buffer)
 	static int statsCallCount = 0;
 	statsCallCount++;
 
-	/* Early exit if we already captured perfect data */
-	if (stopStatsProcessing_.load(std::memory_order_acquire)) {
-		LOG(MicrochipISC, Debug) << "📊 Perfect histogram already captured, ignoring buffer #" << statsCallCount;
-		return;
-	}
-
 	if (isShuttingDown_.load(std::memory_order_acquire)) {
 		LOG(MicrochipISC, Debug) << "📊 Ignoring stats buffer #" << statsCallCount << " during shutdown";
 		return;
@@ -427,13 +421,7 @@ void MicrochipISCCameraData::statsBufferReady(FrameBuffer *buffer)
 				lastHistogramTimestamp_.store(timestamp, std::memory_order_release);
 				histogramDataReady_.store(true, std::memory_order_release);
 
-				/* 🔧 NEW: Stop all future processing */
-				stopStatsProcessing_.store(true, std::memory_order_release);
-
-				LOG(MicrochipISC, Debug) << "PERFECT HISTOGRAM CAPTURED - stopping stats processing";
-
-				munmap(mappedMemory, bufferSize);
-				return;  /* Don't re-queue */
+				LOG(MicrochipISC, Debug) << "PERFECT HISTOGRAM CAPTURED - forwarding to IPA";
 			}
 		}
 	}
@@ -443,8 +431,7 @@ void MicrochipISCCameraData::statsBufferReady(FrameBuffer *buffer)
 	}
 
 requeue_buffer:
-	if (!stopStatsProcessing_.load(std::memory_order_acquire) &&
-		!isShuttingDown_.load(std::memory_order_acquire) &&
+	if (!isShuttingDown_.load(std::memory_order_acquire) &&
 		statsDevice_ && statsStreaming_) {
 
 		int ret = statsDevice_->queueBuffer(buffer);
@@ -453,8 +440,6 @@ requeue_buffer:
 				LOG(MicrochipISC, Debug) << "📊 Device stopping, buffer re-queue expected to fail";
 			} else {
 				LOG(MicrochipISC, Error) << "❌ Failed to re-queue stats buffer: " << ret;
-				/* Stop trying on error */
-				stopStatsProcessing_.store(true, std::memory_order_release);
 			}
 		} else {
 			LOG(MicrochipISC, Debug) << "📊 Re-queued histogram buffer #" << statsCallCount;
@@ -949,11 +934,12 @@ int PipelineHandlerMicrochipISC::start(Camera *camera, [[maybe_unused]] const Co
 	data->iscVideo_->setControls(&awbCtrls);
 
 	if (data->awbIPA_) {
-		int ipaRet = data->awbIPA_->start();
+		int ipaRet = data->awbIPA_->start(&data->dropFrameCount_);
 		if (ipaRet < 0) {
 			LOG(MicrochipISC, Error) << "Failed to start IPA: " << ipaRet;
 			return ipaRet;
 		}
+		LOG(MicrochipISC, Debug) << "IPA requested to drop " << data->dropFrameCount_ << " frames for convergence";
 	}
 
 	/* Start histogram collection with longer setup time */
@@ -1576,8 +1562,6 @@ int PipelineHandlerMicrochipISC::queueRequestDevice(Camera *camera, Request *req
 			<< (data->sceneAnalysisMode_ == 1 ? "STILL" : "VIDEO");
 	}
 
-	data->stopStatsProcessing_.store(false, std::memory_order_release);
-
 	data->resetFrameCycling();
 
 	int ret = processControls(data, request);
@@ -1618,86 +1602,65 @@ void PipelineHandlerMicrochipISC::bufferReady(FrameBuffer *buffer)
 	}
 
 	data->currentFrameCount_++;
-	LOG(MicrochipISC, Debug) << "📷 Frame " << data->currentFrameCount_ << " ready - monitoring for all 4 histogram channels";
 
 	/* Store the first request for frame cycling */
 	if (data->currentFrameCount_ == 1) {
 		data->pendingRequest_ = request;
-		LOG(MicrochipISC, Debug) << "🔄 Starting extended histogram cycling (20 frames like fswebcam -S 20)";
+		LOG(MicrochipISC, Debug) << "🔄 Starting convergence loop (Target drop: " << data->dropFrameCount_ << " frames)";
 	}
 
-	const int MAX_FRAMES_FOR_HISTOGRAM = 20;
-
+	/* PROCESS STATS ON EVERY FRAME FOR CONVERGENCE */
 	bool hardwareDataReady = data->histogramDataReady_.load(std::memory_order_acquire);
 
 	if (hardwareDataReady) {
-		LOG(MicrochipISC, Debug) << "⚡ Frame " << data->currentFrameCount_ << ": SUCCESS! Using hardware histogram";
-
 		std::lock_guard<std::mutex> lock(data->histogramMutex_);
 		if (data->cachedHistogramData_ && data->awbIPA_) {
 			try {
 				data->awbIPA_->processStats(*data->cachedHistogramData_);
 				data->histogramDataReady_.store(false, std::memory_order_release);
-				LOG(MicrochipISC, Debug) << "✅ Hardware histogram processed successfully on frame " << data->currentFrameCount_;
-
-				completeRequestWithBuffer(data->pendingRequest_ ? data->pendingRequest_ : request, buffer);
-				LOG(MicrochipISC, Debug) << "🎯 SUCCESS: Request completed with HARDWARE AWB after " << data->currentFrameCount_ << " frames";
-				data->resetFrameCycling();
-				return;
-
 			} catch (const std::exception& e) {
 				LOG(MicrochipISC, Error) << "Hardware histogram processing failed: " << e.what();
 			}
 		}
+	} else {
+		/* Fallback to software stats if hardware is not ready yet */
+		void *mappedMemory = mmap(NULL, buffer->planes()[0].length, PROT_READ, MAP_SHARED,
+				buffer->planes()[0].fd.get(), buffer->planes()[0].offset);
+
+		if (mappedMemory != MAP_FAILED) {
+			ControlList controls(controls::controls);
+			controls.set(ipa::microchip_isc::ISC_PIXEL_VALUES_ID,
+					Span<const uint8_t>(static_cast<const uint8_t*>(mappedMemory),
+						buffer->planes()[0].length));
+			controls.set(ipa::microchip_isc::IPA_ALGORITHM_ENABLE_ID,
+					static_cast<int32_t>(data->algorithmEnableFlags_));
+
+			if (data->awbIPA_) {
+				data->awbIPA_->processStats(controls);
+			}
+			munmap(mappedMemory, buffer->planes()[0].length);
+		}
 	}
 
-	if (data->currentFrameCount_ < MAX_FRAMES_FOR_HISTOGRAM) {
-		/* Continue cycling - still waiting for hardware histogram */
-		LOG(MicrochipISC, Debug) << "🔄 Frame " << data->currentFrameCount_ << "/" << MAX_FRAMES_FOR_HISTOGRAM
-			<< ": Continuing (waiting for all 4 histogram channels)";
-
-		/* Re-queue the same buffer to get more frames */
+	/* DROP FRAME LOOP LOGIC */
+	if (data->currentFrameCount_ <= data->dropFrameCount_) {
+		LOG(MicrochipISC, Debug) << "🔄 Dropping frame " << data->currentFrameCount_ 
+			<< "/" << data->dropFrameCount_ << " for algorithm convergence";
+		
 		int ret = data->iscVideo_->queueBuffer(buffer);
 		if (ret < 0) {
-			LOG(MicrochipISC, Error) << "Failed to re-queue buffer: " << ret;
-			/* Force completion on error - fall through to software processing */
-		} else {
-			return;
+			LOG(MicrochipISC, Error) << "Failed to re-queue buffer during drop: " << ret;
+			completeRequestWithBuffer(data->pendingRequest_ ? data->pendingRequest_ : request, buffer);
+			data->resetFrameCycling();
 		}
+		return;
 	}
 
-	/* TIMEOUT: Use software fallback after MAX_FRAMES_FOR_HISTOGRAM */
-	LOG(MicrochipISC, Warning) << "⏰ Timeout after " << data->currentFrameCount_ << " frames - completing with software AWB";
-
-	void *mappedMemory = mmap(NULL, buffer->planes()[0].length, PROT_READ, MAP_SHARED,
-			buffer->planes()[0].fd.get(), buffer->planes()[0].offset);
-
-	if (mappedMemory != MAP_FAILED) {
-		/* Send pixel data to IPA for software histogram processing */
-		ControlList controls(controls::controls);
-		controls.set(ipa::microchip_isc::ISC_PIXEL_VALUES_ID,
-				Span<const uint8_t>(static_cast<const uint8_t*>(mappedMemory),
-					buffer->planes()[0].length));
-		controls.set(ipa::microchip_isc::IPA_ALGORITHM_ENABLE_ID,
-				static_cast<int32_t>(data->algorithmEnableFlags_));
-
-		if (data->awbIPA_) {
-			LOG(MicrochipISC, Debug) << "Sending pixel data to IPA for software AWB processing";
-			data->awbIPA_->processStats(controls);
-		}
-
-		munmap(mappedMemory, buffer->planes()[0].length);
-
-		completeRequestWithBuffer(data->pendingRequest_ ? data->pendingRequest_ : request, buffer);
-		LOG(MicrochipISC, Debug) << "🏁 Request completed with software AWB after " << data->currentFrameCount_ << " frames";
-		data->resetFrameCycling();
-
-	} else {
-		LOG(MicrochipISC, Error) << "Failed to map buffer for software processing: " << strerror(errno);
-
-		completeRequestWithBuffer(data->pendingRequest_ ? data->pendingRequest_ : request, buffer);
-		data->resetFrameCycling();
-	}
+	/* CONVERGENCE ACHIEVED - COMPLETE THE REQUEST */
+	LOG(MicrochipISC, Debug) << "🎯 Convergence achieved! Completing request after " 
+		<< data->currentFrameCount_ << " frames";
+	completeRequestWithBuffer(data->pendingRequest_ ? data->pendingRequest_ : request, buffer);
+	data->resetFrameCycling();
 }
 
 void PipelineHandlerMicrochipISC::completeRequestWithBuffer(Request *request, FrameBuffer *buffer)
